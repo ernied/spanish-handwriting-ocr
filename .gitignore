@@ -1,0 +1,10 @@
+# Ignore large model outputs and temp data
+model_output/
+logs/
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+.ipynb_checkpoints/
+.env
+scans/
