@@ -451,6 +451,94 @@ def cmd_split(args):
 
 
 # ---------------------------------------------------------------------------
+# Pre-OCR support
+# ---------------------------------------------------------------------------
+
+def _materialize_model(model, device):
+    """Move model to device, fixing any tensors stuck on meta device."""
+    import torch
+    # Fix plain tensor attributes on meta device (e.g. sinusoidal embeddings)
+    for name, mod in model.named_modules():
+        for attr_name in list(vars(mod).keys()):
+            val = getattr(mod, attr_name, None)
+            if isinstance(val, torch.Tensor) and val.device.type == "meta":
+                setattr(mod, attr_name,
+                        torch.zeros(val.shape, dtype=val.dtype, device=device))
+    model.to(device)
+
+
+def load_ocr_models(model_dir="model_output"):
+    """Load base and fine-tuned TrOCR models for pre-OCR. Returns dict of models."""
+    import torch
+    from transformers import VisionEncoderDecoderModel, TrOCRProcessor
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    models = {}
+
+    # Spanish base model (printed text but Spanish-aware decoder)
+    print("Loading Spanish TrOCR model...")
+    base_proc = TrOCRProcessor.from_pretrained("qantev/trocr-base-spanish")
+    base_model = VisionEncoderDecoderModel.from_pretrained(
+        "qantev/trocr-base-spanish")
+    # Force all parameters off meta device (transformers 5.x compat)
+    _materialize_model(base_model, device)
+    models["spanish-base"] = (base_proc, base_model)
+
+    # Fine-tuned model (if available)
+    if Path(model_dir).exists() and (Path(model_dir) / "model.safetensors").exists():
+        print("Loading fine-tuned model...")
+        try:
+            ft_proc = TrOCRProcessor.from_pretrained(model_dir)
+            ft_model = VisionEncoderDecoderModel.from_pretrained(model_dir)
+            _materialize_model(ft_model, device)
+            models["finetuned"] = (ft_proc, ft_model)
+        except Exception as e:
+            print(f"  Could not load fine-tuned model: {e}")
+
+    print(f"OCR ready ({len(models)} model(s) loaded on {device}).")
+    return models, device
+
+
+def ocr_image(img_path, models, device):
+    """Run OCR on an image using all loaded models.
+
+    Returns (best_text, model_name, details) where details is a list of
+    (model_name, text, score) for each model.
+    """
+    import torch
+
+    pil_img = Image.open(img_path).convert("RGB")
+    details = []
+
+    for name, (processor, model) in models.items():
+        pixel_values = processor(images=pil_img, return_tensors="pt").pixel_values.to(device)
+        with torch.no_grad():
+            outputs = model.generate(
+                pixel_values,
+                output_scores=True,
+                return_dict_in_generate=True,
+                max_new_tokens=128,
+            )
+        text = processor.batch_decode(outputs.sequences, skip_special_tokens=True)[0]
+        # Compute average log-probability as confidence score
+        if outputs.scores:
+            log_probs = []
+            for i, score in enumerate(outputs.scores):
+                token_id = outputs.sequences[0, i + 1]
+                log_prob = torch.nn.functional.log_softmax(score, dim=-1)
+                log_probs.append(log_prob[0, token_id].item())
+            avg_score = sum(log_probs) / len(log_probs) if log_probs else -999
+        else:
+            avg_score = -999
+        details.append((name, text, avg_score))
+
+    # Pick the result with highest confidence
+    details.sort(key=lambda x: x[2], reverse=True)
+    best_name, best_text, _ = details[0]
+    return best_text, best_name, details
+
+
+# ---------------------------------------------------------------------------
 # Label command
 # ---------------------------------------------------------------------------
 
@@ -484,6 +572,12 @@ def cmd_label(args):
 
     print(f"Found {len(unlabeled)} unlabeled images ({len(labeled)} already labeled).")
 
+    # Load OCR models if requested
+    ocr_models = None
+    ocr_device = None
+    if getattr(args, "pre_ocr", False):
+        ocr_models, ocr_device = load_ocr_models()
+
     root = tk.Tk()
     root.title("Label Lines")
 
@@ -500,6 +594,10 @@ def cmd_label(args):
     # Progress label
     progress_label = ttk.Label(root)
     progress_label.pack(padx=10)
+
+    # OCR info label (shows which model was used)
+    ocr_info_label = ttk.Label(root, foreground="gray")
+    ocr_info_label.pack(padx=10)
 
     # Text entry
     entry_frame = ttk.Frame(root)
@@ -534,8 +632,19 @@ def cmd_label(args):
         n_done = len(state["new_labels"])
         progress_label.configure(
             text=f"Image {idx + 1} / {len(unlabeled)}  |  {n_done} labeled this session")
-        text_var.set("")
+
+        # Pre-fill with OCR if available
+        if ocr_models:
+            best_text, model_name, details = ocr_image(img_path, ocr_models, ocr_device)
+            text_var.set(best_text)
+            info_parts = [f"{name}: {text[:50]}" for name, text, score in details]
+            ocr_info_label.configure(text=f"Pre-OCR ({model_name}): " + " | ".join(info_parts))
+        else:
+            text_var.set("")
+            ocr_info_label.configure(text="")
+
         entry.focus_set()
+        entry.select_range(0, tk.END)
 
     def _save_and_next():
         """Save the current transcription and move to next image."""
@@ -546,12 +655,15 @@ def cmd_label(args):
             entry_data = {"image": f"images/{img_path.name}", "text": text}
             state["new_labels"].append(entry_data)
             # Append immediately so progress isn't lost on crash
+            # Ensure previous content ends with newline
+            needs_newline = False
+            if labels_file.exists() and labels_file.stat().st_size > 0:
+                with open(labels_file, "rb") as fb:
+                    fb.seek(-1, 2)
+                    needs_newline = fb.read(1) != b"\n"
             with open(labels_file, "a", encoding="utf-8") as f:
-                # Ensure previous content ends with newline
-                if f.tell() > 0:
-                    f.seek(f.tell() - 1)
-                    if f.read(1) != "\n":
-                        f.write("\n")
+                if needs_newline:
+                    f.write("\n")
                 f.write(json.dumps(entry_data, ensure_ascii=False) + "\n")
             print(f"  Labeled: {img_path.name}")
         state["index"] += 1
@@ -618,6 +730,8 @@ def main():
 
     # -- label --
     sp_label = subparsers.add_parser("label", help="Interactively label line images")
+    sp_label.add_argument("--pre-ocr", action="store_true",
+                          help="Pre-fill transcriptions using TrOCR (base + fine-tuned)")
     sp_label.set_defaults(func=cmd_label)
 
     args = parser.parse_args()
