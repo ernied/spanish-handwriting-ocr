@@ -3,4 +3,6 @@ transformers
 datasets
 Pillow
 opencv-python
+numpy
+scikit-image
 spacy
