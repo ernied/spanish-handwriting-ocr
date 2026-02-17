@@ -62,7 +62,7 @@ trainer = Seq2SeqTrainer(
     model=model,
     args=training_args,
     train_dataset=dataset,
-    tokenizer=processor.feature_extractor,
+    processing_class=processor.feature_extractor,
 )
 
 # Train!
