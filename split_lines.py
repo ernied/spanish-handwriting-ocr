@@ -455,7 +455,10 @@ def cmd_split(args):
 # ---------------------------------------------------------------------------
 
 def cmd_label(args):
-    """Interactive labeling: show unlabeled images, prompt for transcription."""
+    """GUI labeling: show each unlabeled image with a text entry field."""
+    import tkinter as tk
+    from tkinter import ttk
+
     images_dir = Path("dataset/images")
     labels_file = Path("dataset/labels.jsonl")
 
@@ -480,38 +483,103 @@ def cmd_label(args):
         return
 
     print(f"Found {len(unlabeled)} unlabeled images ({len(labeled)} already labeled).")
-    print("Type the transcription for each line. Commands:")
-    print("  [Enter with empty text] — skip this image")
-    print("  !quit — stop labeling and save")
-    print()
 
-    new_labels = []
-    for img_path in unlabeled:
-        # Show the image using the default viewer
+    root = tk.Tk()
+    root.title("Label Lines")
+
+    state = {"index": 0, "new_labels": []}
+
+    # Image display
+    img_label = ttk.Label(root)
+    img_label.pack(padx=10, pady=5)
+
+    # Filename label
+    name_label = ttk.Label(root, font=("TkDefaultFont", 10, "bold"))
+    name_label.pack(padx=10)
+
+    # Progress label
+    progress_label = ttk.Label(root)
+    progress_label.pack(padx=10)
+
+    # Text entry
+    entry_frame = ttk.Frame(root)
+    entry_frame.pack(fill=tk.X, padx=10, pady=5)
+    ttk.Label(entry_frame, text="Transcription:").pack(side=tk.LEFT)
+    text_var = tk.StringVar()
+    entry = ttk.Entry(entry_frame, textvariable=text_var, width=100)
+    entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+    entry.focus_set()
+
+    tk_images = []  # prevent GC
+
+    def show_image(idx):
+        """Display the image at the given index."""
+        if idx >= len(unlabeled):
+            _finish()
+            return
+
+        img_path = unlabeled[idx]
         pil_img = Image.open(img_path)
-        pil_img.show()
+        # Scale to fit width ~900px, keep aspect ratio
+        scale = min(1.0, 900 / pil_img.width)
+        display_size = (int(pil_img.width * scale), int(pil_img.height * scale))
+        pil_img = pil_img.resize(display_size, Image.LANCZOS)
 
-        print(f"--- {img_path.name} ---")
-        text = input("Transcription: ").strip()
+        tk_img = tk.PhotoImage(data=_pil_to_ppm(pil_img))
+        tk_images.clear()
+        tk_images.append(tk_img)
+        img_label.configure(image=tk_img)
 
-        if text == "!quit":
-            break
-        if not text:
-            print("  (skipped)")
-            continue
+        name_label.configure(text=img_path.name)
+        n_done = len(state["new_labels"])
+        progress_label.configure(
+            text=f"Image {idx + 1} / {len(unlabeled)}  |  {n_done} labeled this session")
+        text_var.set("")
+        entry.focus_set()
 
-        entry = {"image": f"images/{img_path.name}", "text": text}
-        new_labels.append(entry)
-        print(f"  Saved: {text[:60]}...")
+    def _save_and_next():
+        """Save the current transcription and move to next image."""
+        text = text_var.get().strip()
+        idx = state["index"]
+        if text:
+            img_path = unlabeled[idx]
+            entry_data = {"image": f"images/{img_path.name}", "text": text}
+            state["new_labels"].append(entry_data)
+            # Append immediately so progress isn't lost on crash
+            with open(labels_file, "a", encoding="utf-8") as f:
+                # Ensure previous content ends with newline
+                if f.tell() > 0:
+                    f.seek(f.tell() - 1)
+                    if f.read(1) != "\n":
+                        f.write("\n")
+                f.write(json.dumps(entry_data, ensure_ascii=False) + "\n")
+            print(f"  Labeled: {img_path.name}")
+        state["index"] += 1
+        show_image(state["index"])
 
-    # Append new labels
-    if new_labels:
-        with open(labels_file, "a", encoding="utf-8") as f:
-            for entry in new_labels:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        print(f"\nAppended {len(new_labels)} labels to {labels_file}")
-    else:
-        print("\nNo new labels added.")
+    def _skip():
+        """Skip the current image."""
+        state["index"] += 1
+        show_image(state["index"])
+
+    def _finish():
+        """Close the labeling window."""
+        n = len(state["new_labels"])
+        print(f"Labeling done. {n} new labels saved to {labels_file}")
+        root.destroy()
+
+    # Bind Enter key to save
+    entry.bind("<Return>", lambda e: _save_and_next())
+
+    # Buttons
+    btn_frame = ttk.Frame(root)
+    btn_frame.pack(fill=tk.X, padx=10, pady=5)
+    ttk.Button(btn_frame, text="Save & Next (Enter)", command=_save_and_next).pack(side=tk.LEFT, padx=3)
+    ttk.Button(btn_frame, text="Skip", command=_skip).pack(side=tk.LEFT, padx=3)
+    ttk.Button(btn_frame, text="Quit", command=_finish).pack(side=tk.RIGHT, padx=3)
+
+    show_image(0)
+    root.mainloop()
 
 
 # ---------------------------------------------------------------------------
